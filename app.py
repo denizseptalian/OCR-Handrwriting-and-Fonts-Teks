@@ -16,7 +16,8 @@ from PIL import Image
 try:
     from tflite_runtime.interpreter import Interpreter
 except ImportError:
-    from tensorflow.lite.python.interpreter import Interpreter
+    import tensorflow as tf
+    Interpreter = tf.lite.Interpreter
 
 # ============================================================
 # Konfigurasi
