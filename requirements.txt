@@ -1,6 +1,6 @@
 streamlit>=1.36
 opencv-python-headless
-numpy<2
+numpy
 Pillow
 gTTS
-tflite-runtime==2.14.0
+ai-edge-litert
