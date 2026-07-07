@@ -12,12 +12,15 @@ import streamlit as st
 from gtts import gTTS
 from PIL import Image
 
-# --- TFLite interpreter: coba tflite-runtime dulu (ringan), fallback ke tensorflow ---
+# --- TFLite interpreter: LiteRT (pengganti resmi tflite-runtime) ---
 try:
-    from tflite_runtime.interpreter import Interpreter
+    from ai_edge_litert.interpreter import Interpreter
 except ImportError:
-    import tensorflow as tf
-    Interpreter = tf.lite.Interpreter
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except ImportError:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
 
 # ============================================================
 # Konfigurasi
