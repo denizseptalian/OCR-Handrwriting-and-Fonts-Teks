@@ -61,6 +61,25 @@ st.markdown("""
 
 /* Judul lebih ringkas di HP */
 h1 { font-size: 1.5rem !important; }
+
+/* Perbesar preview kamera: penuhi lebar layar */
+[data-testid="stCameraInput"] { width: 100% !important; }
+[data-testid="stCameraInput"] > div { width: 100% !important; }
+[data-testid="stCameraInput"] video {
+    width: 100% !important;
+    height: auto !important;
+    min-height: 60vh;              /* preview tinggi, mudah membidik patok */
+    object-fit: cover;
+    border-radius: 12px;
+}
+[data-testid="stCameraInput"] img {
+    width: 100% !important;
+    height: auto !important;
+    border-radius: 12px;
+}
+[data-testid="stCameraInput"] button {
+    min-height: 3.2rem; font-size: 1.15rem; border-radius: 12px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -229,6 +248,22 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05):
         cv2.putText(vis, ch, (x, max(y - 10, 25)),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 0, 0), tebal + 1)
 
+    # 7) Versi background dihapus: kertas putih bersih + tulisan hitam
+    bersih = cv2.cvtColor(255 - binary, cv2.COLOR_GRAY2RGB)
+    vis_bersih = bersih.copy()
+    if sep_box is not None:
+        sx, sy, sw, sh = sep_box
+        cv2.rectangle(vis_bersih, (sx, sy), (sx + sw, sy + sh), (255, 200, 0), tebal)
+    cv2.line(vis_bersih, (0, separator_y), (W_img, separator_y), (0, 0, 255), tebal)
+    for (x, y, w, hh), (ch, cf) in zip(blok_boxes, blok_preds):
+        cv2.rectangle(vis_bersih, (x, y), (x + w, y + hh), (0, 170, 0), tebal)
+        cv2.putText(vis_bersih, ch, (x, max(y - 10, 25)),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 170, 0), tebal + 1)
+    for (x, y, w, hh), (ch, cf) in zip(tph_boxes, tph_preds):
+        cv2.rectangle(vis_bersih, (x, y), (x + w, y + hh), (220, 0, 0), tebal)
+        cv2.putText(vis_bersih, ch, (x, max(y - 10, 25)),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (220, 0, 0), tebal + 1)
+
     return {
         "nomor_blok": nomor_blok,
         "nomor_tph": nomor_tph,
@@ -236,6 +271,8 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05):
         "tph_preds": tph_preds,
         "sep_found": sep_found,
         "vis": vis,
+        "vis_bersih": vis_bersih,
+        "bersih": bersih,
         "binary": binary,
     }
 
@@ -264,6 +301,7 @@ st.title("🌴 Pembaca Patok Blok / TPH")
 # Pengaturan disembunyikan dalam expander (hemat layar HP)
 with st.expander("⚙️ Pengaturan"):
     suara_aktif = st.toggle("🔊 Bacakan hasil lewat suara", value=True)
+    hapus_bg = st.toggle("🧹 Hapus background (tampilkan tulisan saja)", value=False)
     tampil_biner = st.toggle("Tampilkan gambar biner (debug)", value=False)
     block_size = st.slider("Block size threshold (ganjil)", 21, 81, 41, step=2)
     c_thresh = st.slider("Konstanta C threshold", 5, 35, 15)
@@ -334,7 +372,17 @@ if not hasil["sep_found"]:
     st.warning("Garis pemisah tidak terdeteksi — memakai tengah gambar sebagai batas.")
 
 # Gambar hasil deteksi di bawah kartu
-st.image(hasil["vis"], caption="Hasil deteksi", use_container_width=True)
+if hapus_bg:
+    st.image(hasil["vis_bersih"], caption="Hasil deteksi (background dihapus)",
+             use_container_width=True)
+    # Tombol download gambar bersih tanpa anotasi
+    ok_png, buf_png = cv2.imencode(".png", cv2.cvtColor(hasil["bersih"], cv2.COLOR_RGB2BGR))
+    if ok_png:
+        st.download_button("⬇️ Download gambar bersih (PNG)", data=buf_png.tobytes(),
+                           file_name="patok_bersih.png", mime="image/png",
+                           use_container_width=True)
+else:
+    st.image(hasil["vis"], caption="Hasil deteksi", use_container_width=True)
 
 if tampil_biner:
     st.image(hasil["binary"], caption="Gambar biner (debug)",
