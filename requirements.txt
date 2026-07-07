@@ -1,0 +1,7 @@
+streamlit>=1.36
+opencv-python-headless
+numpy
+Pillow
+gTTS
+tflite-runtime; python_version < "3.12"
+tensorflow-cpu; python_version >= "3.12"
