@@ -268,9 +268,43 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
             if merged:
                 break
 
-    # 4) Bagi ke Blok (atas) & TPH (bawah), urut kiri->kanan
-    blok_boxes = sorted([b for b in boxes if (b[1] + b[3] / 2) < separator_y], key=lambda b: b[0])
-    tph_boxes = sorted([b for b in boxes if (b[1] + b[3] / 2) >= separator_y], key=lambda b: b[0])
+    # 3b) Buang box yang menempel tepi gambar (karakter asli selalu utuh di dalam frame)
+    tepi = max(2, int(0.005 * min(H_img, W_img)))
+    boxes = [b for b in boxes
+             if b[1] > tepi and (b[1] + b[3]) < H_img - tepi
+             and b[0] > tepi and (b[0] + b[2]) < W_img - tepi]
+
+    # 4) Bagi ke Blok (atas) & TPH (bawah)
+    blok_boxes = [b for b in boxes if (b[1] + b[3] / 2) < separator_y]
+    tph_boxes = [b for b in boxes if (b[1] + b[3] / 2) >= separator_y]
+
+    # 4b) Di tiap sisi, kelompokkan per baris dan ambil HANYA baris terdekat garis pemisah.
+    #     Tulisan Blok selalu tepat di atas garis, TPH tepat di bawah — blob lain
+    #     (coretan di pojok atas/bawah) berada di baris berbeda dan dibuang.
+    def baris_terdekat(box_list, ambil_terbawah):
+        if len(box_list) <= 1:
+            return box_list
+        urut = sorted(box_list, key=lambda b: b[1] + b[3] / 2)
+        rows = []
+        for b in urut:
+            cy = b[1] + b[3] / 2
+            placed = False
+            for row in rows:
+                row_cy = np.mean([rb[1] + rb[3] / 2 for rb in row])
+                row_h = np.mean([rb[3] for rb in row])
+                if abs(cy - row_cy) < 0.7 * row_h:
+                    row.append(b)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([b])
+        if len(rows) == 1:
+            return rows[0]
+        rows.sort(key=lambda row: np.mean([rb[1] + rb[3] / 2 for rb in row]))
+        return rows[-1] if ambil_terbawah else rows[0]
+
+    blok_boxes = sorted(baris_terdekat(blok_boxes, ambil_terbawah=True), key=lambda b: b[0])
+    tph_boxes = sorted(baris_terdekat(tph_boxes, ambil_terbawah=False), key=lambda b: b[0])
 
     # 5) Prediksi
     blok_preds = [predict_char(to_model_input(binary[y:y + hh, x:x + w]))
@@ -385,8 +419,8 @@ if img_file is None:
 pil_img = Image.open(img_file).convert("RGB")
 bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-# Foto dari kamera: crop tengah ke rasio 4:5 supaya SAMA dengan preview
-# (preview memakai object-fit: cover, jadi pinggiran di luar frame dibuang)
+# Foto dari kamera: crop tengah 4:5 (samakan dengan preview),
+# lalu crop lagi ke KOTAK PANDUAN putus-putus — hanya area itu yang diproses
 if dari_kamera:
     Hf, Wf = bgr.shape[:2]
     target = 4 / 5  # lebar : tinggi
@@ -398,6 +432,11 @@ if dari_kamera:
         new_h = int(Wf / target)
         y0 = (Hf - new_h) // 2
         bgr = bgr[y0:y0 + new_h, :]
+
+    # Kotak panduan (harus sama dengan CSS ::after): top 8%, kiri/kanan 12%, bottom 22%
+    Hf, Wf = bgr.shape[:2]
+    bgr = bgr[int(0.08 * Hf):int((1 - 0.22) * Hf),
+              int(0.12 * Wf):int((1 - 0.12) * Wf)]
 
 # Proses
 with st.spinner("Memproses..."):
