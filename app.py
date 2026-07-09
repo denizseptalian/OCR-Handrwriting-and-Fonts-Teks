@@ -82,6 +82,16 @@ h1 { font-size: 1.5rem !important; }
     border-radius: 14px;
     pointer-events: none;
 }
+/* Garis bantu tengah: sejajarkan garis patok (pemisah Blok/TPH) dengan garis ini */
+[data-testid="stCameraInput"]::before {
+    content: "";
+    position: absolute;
+    top: 43%;                       /* tengah vertikal kotak panduan */
+    left: 12%; right: 12%;
+    border-top: 3px dashed rgba(59, 130, 246, 0.9);   /* biru */
+    pointer-events: none;
+    z-index: 2;
+}
 [data-testid="stCameraInput"] img {
     width: 100% !important;
     height: auto !important;
@@ -170,7 +180,7 @@ def predict_char(xin, digits_only=False):
 
 
 def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
-               hapus_bg=True, hilangkan_noise=True):
+               hapus_bg=True, hilangkan_noise=True, auto_roi=True):
     """Deteksi garis pemisah + baca Blok (atas) & TPH (bawah).
 
     hapus_bg: ratakan background (noda, bayangan, gradasi cahaya) SEBELUM threshold.
@@ -198,6 +208,31 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
 
     H_img, W_img = binary.shape
 
+    # 1a) FOKUS OTOMATIS: cari garis patok (garis horizontal terpanjang) di mana pun
+    #     posisinya, lalu proses HANYA area di sekitarnya. Ini membuat hasil tidak
+    #     tergantung framing kamera — coretan lain di dinding otomatis terabaikan.
+    if auto_roi:
+        horiz_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, W_img // 10), 1))
+        garis = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_k)
+        cnts_g, _ = cv2.findContours(garis, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        for cg in cnts_g:
+            gx, gy, gw, gh = cv2.boundingRect(cg)
+            if gw > 0.2 * W_img and (best is None or gw > best[2]):
+                best = (gx, gy, gw, gh)
+        if best is not None:
+            lx, ly, lw, lh = best
+            mx = int(0.25 * lw)          # margin kiri-kanan
+            my = int(1.4 * lw)           # tinggi area Blok/TPH ~ selebar garis
+            x0 = max(0, lx - mx)
+            x1 = min(W_img, lx + lw + mx)
+            y0 = max(0, ly - my)
+            y1 = min(H_img, ly + lh + my)
+            # Crop hanya kalau area patok jelas lebih kecil dari frame
+            if (x1 - x0) < 0.9 * W_img or (y1 - y0) < 0.9 * H_img:
+                return baca_patok(bgr[y0:y1, x0:x1], block_size, c_thresh, min_h_ratio,
+                                  hapus_bg, hilangkan_noise, auto_roi=False)
+
     # 1b) HILANGKAN NOISE: buang blob yang jelas bukan karakter/garis pemisah
     if hilangkan_noise:
         n_lbl, lbl, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
@@ -206,7 +241,7 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
             x, y, w, hh, area = stats[i]
             density = area / max(w * hh, 1)
             # Kandidat garis pemisah: sangat lebar & pipih -> selalu pertahankan
-            if w > 0.5 * W_img and w / max(hh, 1) > 4:
+            if w > 0.35 * W_img and w / max(hh, 1) > 4:
                 keep[i] = True
                 continue
             # Bintik/kotoran kecil
@@ -233,7 +268,7 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
         x, y, w, hh = cv2.boundingRect(c)
         if w * hh < 0.001 * H_img * W_img:
             continue
-        if w > 0.5 * W_img and w / max(hh, 1) > 4:
+        if w > 0.35 * W_img and w / max(hh, 1) > 4:
             separator_y = y + hh // 2
             sep_box = (x, y, w, hh)
             continue
@@ -386,6 +421,7 @@ st.title("🌴 Pembaca Patok Blok / TPH")
 with st.expander("⚙️ Pengaturan"):
     suara_aktif = st.toggle("🔊 Bacakan hasil lewat suara", value=True)
     hapus_bg = st.toggle("🧹 Hapus background sebelum diproses model", value=True)
+    fokus_otomatis = st.toggle("🎯 Fokus otomatis ke area patok", value=True)
     hilangkan_noise = st.toggle("✨ Hilangkan noise/kotoran non-karakter", value=True)
     tampil_biner = st.toggle("Tampilkan gambar biner (debug)", value=False)
     block_size = st.slider("Block size threshold (ganjil)", 21, 81, 41, step=2)
@@ -398,7 +434,7 @@ tab_kamera, tab_upload = st.tabs(["📷 Kamera", "🖼️ Upload"])
 img_file = None
 dari_kamera = False
 with tab_kamera:
-    st.caption("Posisikan tulisan patok di dalam kotak putus-putus.")
+    st.caption("Posisikan patok di dalam kotak, sejajarkan garis patok dengan garis biru.")
     foto = st.camera_input("Arahkan ke patok, lalu ambil foto",
                            label_visibility="collapsed")
     if foto is not None:
@@ -441,7 +477,8 @@ if dari_kamera:
 # Proses
 with st.spinner("Memproses..."):
     hasil = baca_patok(bgr, block_size=block_size, c_thresh=c_thresh, min_h_ratio=min_h,
-                       hapus_bg=hapus_bg, hilangkan_noise=hilangkan_noise)
+                       hapus_bg=hapus_bg, hilangkan_noise=hilangkan_noise,
+                       auto_roi=fokus_otomatis)
 
 terdeteksi = bool(hasil["nomor_blok"] or hasil["nomor_tph"])
 
