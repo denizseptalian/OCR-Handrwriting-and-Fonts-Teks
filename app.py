@@ -158,8 +158,27 @@ def y_gap(a, b):
 
 
 def to_model_input(char_bin):
+    """Crop biner satu karakter -> input model 32x32.
+
+    Optimasi per-karakter:
+    - Deskew ringan: luruskan kemiringan tulisan tangan (bukan lekuk huruf).
+    - Padding persegi proporsional supaya bentuk tidak gepeng saat resize.
+    """
+    hh, ww = char_bin.shape
+
+    # Deskew ringan berbasis sudut kotak pembungkus minimum
+    ys, xs = np.where(char_bin > 0)
+    if len(xs) > 20:
+        pts = np.column_stack([xs, ys]).astype(np.float32)
+        angle = cv2.minAreaRect(pts)[-1]
+        if angle < -45:
+            angle += 90
+        # Hanya koreksi miring sedang (3-25 derajat) - lekuk huruf alami diabaikan
+        if 3 < abs(angle) < 25:
+            M = cv2.getRotationMatrix2D((ww / 2, hh / 2), angle, 1.0)
+            char_bin = cv2.warpAffine(char_bin, M, (ww, hh), borderValue=0)
+
     inv = 255 - char_bin
-    hh, ww = inv.shape
     side = int(max(hh, ww) * 1.3)
     canvas = np.full((side, side), 255, np.uint8)
     y0 = (side - hh) // 2
@@ -169,14 +188,16 @@ def to_model_input(char_bin):
     return small.astype(np.float32)[None, :, :, None] / 255.0
 
 
-def predict_char(xin, digits_only=False):
+def predict_char(xin, digits_only=False, top_k=3):
+    """Prediksi 1 karakter. Return (label_terbaik, conf_terbaik, [top-k alternatif])."""
     interp.set_tensor(inp["index"], xin)
     interp.invoke()
     prob = interp.get_tensor(out["index"])[0].copy()
     if digits_only:
         prob[10:] = 0
-    k = int(prob.argmax())
-    return CLASSES[k], float(prob[k])
+    order = prob.argsort()[::-1][:top_k]
+    alternatif = [(CLASSES[i], float(prob[i])) for i in order]
+    return alternatif[0][0], alternatif[0][1], alternatif
 
 
 def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
@@ -208,42 +229,76 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
 
     H_img, W_img = binary.shape
 
-    # 1a) FOKUS OTOMATIS: cari garis patok (garis horizontal terpanjang) di mana pun
-    #     posisinya, lalu proses HANYA area di sekitarnya. Ini membuat hasil tidak
-    #     tergantung framing kamera — coretan lain di dinding otomatis terabaikan.
-    if auto_roi:
-        horiz_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, W_img // 10), 1))
-        garis = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_k)
-        cnts_g, _ = cv2.findContours(garis, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 1a) CARI GARIS PATOK via Hough — jauh lebih andal daripada morfologi untuk
+    #     garis tipis/agak miring, dan tidak peduli seberapa lebar frame di sekitarnya.
+    def cari_garis(bin_img):
+        Hh, Ww = bin_img.shape
+        min_len = max(20, int(0.15 * Ww))
+        lines = cv2.HoughLinesP(bin_img, 1, np.pi / 180, threshold=35,
+                                minLineLength=min_len, maxLineGap=max(8, Ww // 40))
+        if lines is None:
+            return None
         best = None
-        for cg in cnts_g:
-            gx, gy, gw, gh = cv2.boundingRect(cg)
-            if gw > 0.2 * W_img and (best is None or gw > best[2]):
-                best = (gx, gy, gw, gh)
-        if best is not None:
-            lx, ly, lw, lh = best
-            mx = int(0.25 * lw)          # margin kiri-kanan
-            my = int(1.4 * lw)           # tinggi area Blok/TPH ~ selebar garis
-            x0 = max(0, lx - mx)
-            x1 = min(W_img, lx + lw + mx)
-            y0 = max(0, ly - my)
-            y1 = min(H_img, ly + lh + my)
-            # Crop hanya kalau area patok jelas lebih kecil dari frame
-            if (x1 - x0) < 0.9 * W_img or (y1 - y0) < 0.9 * H_img:
-                return baca_patok(bgr[y0:y1, x0:x1], block_size, c_thresh, min_h_ratio,
-                                  hapus_bg, hilangkan_noise, auto_roi=False)
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            dx, dy = x2 - x1, y2 - y1
+            length = (dx ** 2 + dy ** 2) ** 0.5
+            if length < min_len:
+                continue
+            angle = abs(np.degrees(np.arctan2(dy, dx)))
+            if not (angle < 20 or angle > 160):   # harus mendekati horizontal
+                continue
+            if best is None or length > best[0]:
+                best = (length, min(x1, x2), max(x1, x2), (y1 + y2) // 2)
+        if best is None:
+            return None
+        _, xl, xr, yc = best
+        return xl, xr, yc
 
-    # 1b) HILANGKAN NOISE: buang blob yang jelas bukan karakter/garis pemisah
+    garis_hasil = cari_garis(binary)
+
+    # 1b) FOKUS OTOMATIS: kalau garis ditemukan, proses hanya area di sekitarnya.
+    #     Membuat hasil tidak tergantung framing kamera - coretan lain otomatis terabaikan.
+    if auto_roi and garis_hasil is not None:
+        xl, xr, yc = garis_hasil
+        lw = xr - xl
+        mx = int(0.25 * lw)
+        my = int(1.4 * lw)
+        x0 = max(0, xl - mx)
+        x1 = min(W_img, xr + mx)
+        y0 = max(0, yc - my)
+        y1 = min(H_img, yc + my)
+        if (x1 - x0) < 0.9 * W_img or (y1 - y0) < 0.9 * H_img:
+            return baca_patok(bgr[y0:y1, x0:x1], block_size, c_thresh, min_h_ratio,
+                              hapus_bg, hilangkan_noise, auto_roi=False)
+
+    # 1c) HAPUS PITA GARIS dari citra biner SEBELUM analisis komponen.
+    #     Ini kunci: garis yang menyentuh/berdekatan dengan karakter bisa
+    #     menyatukan tulisan Blok dan TPH jadi satu blob raksasa via closing.
+    #     Menghapus pitanya dulu memutus sambungan itu.
+    sep_box = None
+    if garis_hasil is not None:
+        xl, xr, yc = garis_hasil
+        tebal_garis = max(4, int(0.02 * H_img))
+        y0b = max(0, yc - tebal_garis)
+        y1b = min(H_img, yc + tebal_garis)
+        x0b = max(0, xl - int(0.03 * W_img))
+        x1b = min(W_img, xr + int(0.03 * W_img))
+        sep_box = (x0b, y0b, x1b - x0b, y1b - y0b)
+        binary[y0b:y1b, x0b:x1b] = 0
+        separator_y = yc
+        sep_found = True
+    else:
+        separator_y = H_img // 2
+        sep_found = False
+
+    # 1d) HILANGKAN NOISE: buang blob yang jelas bukan karakter (garis sudah dibuang di atas)
     if hilangkan_noise:
         n_lbl, lbl, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         keep = np.zeros(n_lbl, dtype=bool)
         for i in range(1, n_lbl):
             x, y, w, hh, area = stats[i]
             density = area / max(w * hh, 1)
-            # Kandidat garis pemisah: sangat lebar & pipih -> selalu pertahankan
-            if w > 0.35 * W_img and w / max(hh, 1) > 4:
-                keep[i] = True
-                continue
             # Bintik/kotoran kecil
             if area < 0.0008 * H_img * W_img:
                 continue
@@ -259,26 +314,12 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
             keep[i] = True
         binary = np.where(keep[lbl], 255, 0).astype(np.uint8)
 
-    # 2) Deteksi garis pemisah: kontur sangat lebar & pipih
+    # 2) Kontur karakter (garis pemisah sudah tidak ada di citra biner)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    separator_y = None
-    sep_box = None
-    char_contours = []
-    for c in contours:
-        x, y, w, hh = cv2.boundingRect(c)
-        if w * hh < 0.001 * H_img * W_img:
-            continue
-        if w > 0.35 * W_img and w / max(hh, 1) > 4:
-            separator_y = y + hh // 2
-            sep_box = (x, y, w, hh)
-            continue
-        char_contours.append((x, y, w, hh))
+    char_contours = [cv2.boundingRect(c) for c in contours
+                     if cv2.boundingRect(c)[2] * cv2.boundingRect(c)[3] > 0.001 * H_img * W_img]
 
-    sep_found = separator_y is not None
-    if not sep_found:
-        separator_y = H_img // 2
-
-    # 3) Filter + merge fragmen (tidak lintas garis pemisah)
+    # 3) Filter + merge fragmen (tidak lintas garis pemisah, tidak lintas jarak jauh)
     boxes = [list(b) for b in char_contours if b[3] > min_h_ratio * H_img]
 
     merged = True
@@ -290,6 +331,10 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
                 a_atas = (a[1] + a[3] / 2) < separator_y
                 b_atas = (b[1] + b[3] / 2) < separator_y
                 if a_atas != b_atas:
+                    continue
+                # Jangan gabung kalau tinggi keduanya jauh berbeda (kemungkinan bukan
+                # fragmen huruf yang sama, tapi dua karakter berbeda yang kebetulan dekat)
+                if max(a[3], b[3]) > 2.2 * min(a[3], b[3]):
                     continue
                 if x_overlap_ratio(a, b) > 0.4 and y_gap(a, b) < 0.4 * max(a[3], b[3]):
                     x0 = min(a[0], b[0])
@@ -341,14 +386,14 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
     blok_boxes = sorted(baris_terdekat(blok_boxes, ambil_terbawah=True), key=lambda b: b[0])
     tph_boxes = sorted(baris_terdekat(tph_boxes, ambil_terbawah=False), key=lambda b: b[0])
 
-    # 5) Prediksi
+    # 5) Prediksi (masing-masing: label terbaik, confidence, top-3 alternatif)
     blok_preds = [predict_char(to_model_input(binary[y:y + hh, x:x + w]))
                   for (x, y, w, hh) in blok_boxes]
     tph_preds = [predict_char(to_model_input(binary[y:y + hh, x:x + w]), digits_only=True)
                  for (x, y, w, hh) in tph_boxes]
 
-    nomor_blok = "".join(c for c, _ in blok_preds)
-    nomor_tph = "".join(c for c, _ in tph_preds)
+    nomor_blok = "".join(p[0] for p in blok_preds)
+    nomor_tph = "".join(p[0] for p in tph_preds)
 
     # 6) Visualisasi (garis & font tebal supaya terlihat di layar kecil)
     vis = rgb.copy()
@@ -358,11 +403,11 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
         sx, sy, sw, sh = sep_box
         cv2.rectangle(vis, (sx, sy), (sx + sw, sy + sh), (255, 255, 0), tebal)
     cv2.line(vis, (0, separator_y), (W_img, separator_y), (0, 0, 255), tebal)
-    for (x, y, w, hh), (ch, cf) in zip(blok_boxes, blok_preds):
+    for (x, y, w, hh), (ch, cf, _) in zip(blok_boxes, blok_preds):
         cv2.rectangle(vis, (x, y), (x + w, y + hh), (0, 200, 0), tebal)
         cv2.putText(vis, ch, (x, max(y - 10, 25)),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 200, 0), tebal + 1)
-    for (x, y, w, hh), (ch, cf) in zip(tph_boxes, tph_preds):
+    for (x, y, w, hh), (ch, cf, _) in zip(tph_boxes, tph_preds):
         cv2.rectangle(vis, (x, y), (x + w, y + hh), (255, 0, 0), tebal)
         cv2.putText(vis, ch, (x, max(y - 10, 25)),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 0, 0), tebal + 1)
@@ -374,11 +419,11 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
         sx, sy, sw, sh = sep_box
         cv2.rectangle(vis_bersih, (sx, sy), (sx + sw, sy + sh), (255, 200, 0), tebal)
     cv2.line(vis_bersih, (0, separator_y), (W_img, separator_y), (0, 0, 255), tebal)
-    for (x, y, w, hh), (ch, cf) in zip(blok_boxes, blok_preds):
+    for (x, y, w, hh), (ch, cf, _) in zip(blok_boxes, blok_preds):
         cv2.rectangle(vis_bersih, (x, y), (x + w, y + hh), (0, 170, 0), tebal)
         cv2.putText(vis_bersih, ch, (x, max(y - 10, 25)),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 170, 0), tebal + 1)
-    for (x, y, w, hh), (ch, cf) in zip(tph_boxes, tph_preds):
+    for (x, y, w, hh), (ch, cf, _) in zip(tph_boxes, tph_preds):
         cv2.rectangle(vis_bersih, (x, y), (x + w, y + hh), (220, 0, 0), tebal)
         cv2.putText(vis_bersih, ch, (x, max(y - 10, 25)),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (220, 0, 0), tebal + 1)
@@ -534,10 +579,12 @@ if tampil_biner:
     st.image(hasil["binary"], caption="Gambar biner (debug)",
              use_container_width=True, clamp=True)
 
-# Detail confidence dilipat, tidak memenuhi layar
+# Detail confidence dilipat, tidak memenuhi layar (termasuk top-3 alternatif)
 if terdeteksi:
     with st.expander("📊 Detail confidence per karakter"):
-        for ch, cf in hasil["blok_preds"]:
-            st.write(f"Blok — **{ch}** : {cf*100:.0f}%")
-        for ch, cf in hasil["tph_preds"]:
-            st.write(f"TPH — **{ch}** : {cf*100:.0f}%")
+        for ch, cf, top3 in hasil["blok_preds"]:
+            alt = ", ".join(f"{c} {p*100:.0f}%" for c, p in top3)
+            st.write(f"Blok — **{ch}** : {cf*100:.0f}%  \n_alternatif: {alt}_")
+        for ch, cf, top3 in hasil["tph_preds"]:
+            alt = ", ".join(f"{c} {p*100:.0f}%" for c, p in top3)
+            st.write(f"TPH — **{ch}** : {cf*100:.0f}%  \n_alternatif: {alt}_")
