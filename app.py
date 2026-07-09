@@ -232,6 +232,7 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
     # 1a) CARI GARIS PATOK via Hough — jauh lebih andal daripada morfologi untuk
     #     garis tipis/agak miring, dan tidak peduli seberapa lebar frame di sekitarnya.
     def cari_garis(bin_img):
+        bin_img = np.ascontiguousarray(bin_img, dtype=np.uint8)
         Hh, Ww = bin_img.shape
         min_len = max(20, int(0.15 * Ww))
         lines = cv2.HoughLinesP(bin_img, 1, np.pi / 180, threshold=35,
@@ -240,7 +241,7 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
             return None
         best = None
         for l in lines:
-            x1, y1, x2, y2 = l[0]
+            x1, y1, x2, y2 = np.array(l).ravel()[:4]
             dx, dy = x2 - x1, y2 - y1
             length = (dx ** 2 + dy ** 2) ** 0.5
             if length < min_len:
