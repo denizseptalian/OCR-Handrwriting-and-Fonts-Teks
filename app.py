@@ -159,10 +159,24 @@ def predict_char(xin, digits_only=False):
     return CLASSES[k], float(prob[k])
 
 
-def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05):
-    """Deteksi garis pemisah + baca Blok (atas) & TPH (bawah)."""
+def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
+               hapus_bg=True, hilangkan_noise=True):
+    """Deteksi garis pemisah + baca Blok (atas) & TPH (bawah).
+
+    hapus_bg: ratakan background (noda, bayangan, gradasi cahaya) SEBELUM threshold.
+    hilangkan_noise: buang blob non-karakter (goresan, kotoran, bintik) SEBELUM klasifikasi.
+    """
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # 0) HAPUS BACKGROUND (preprocessing sebelum model):
+    #    estimasi background dengan blur besar, lalu bagi -> noda/bayangan/gradasi rata,
+    #    yang tersisa hanya goresan gelap (tulisan)
+    if hapus_bg:
+        k = max(31, (min(gray.shape) // 10) | 1)   # kernel besar, selalu ganjil
+        bg = cv2.medianBlur(gray, min(k, 99))
+        gray = cv2.divide(gray, bg, scale=255)
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     # 1) Threshold: tulisan gelap di background terang
     binary = cv2.adaptiveThreshold(
@@ -173,6 +187,32 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05):
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=2)
 
     H_img, W_img = binary.shape
+
+    # 1b) HILANGKAN NOISE: buang blob yang jelas bukan karakter/garis pemisah
+    if hilangkan_noise:
+        n_lbl, lbl, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        keep = np.zeros(n_lbl, dtype=bool)
+        for i in range(1, n_lbl):
+            x, y, w, hh, area = stats[i]
+            density = area / max(w * hh, 1)
+            # Kandidat garis pemisah: sangat lebar & pipih -> selalu pertahankan
+            if w > 0.5 * W_img and w / max(hh, 1) > 4:
+                keep[i] = True
+                continue
+            # Bintik/kotoran kecil
+            if area < 0.0008 * H_img * W_img:
+                continue
+            # Terlalu pendek untuk jadi karakter
+            if hh < 0.6 * min_h_ratio * H_img:
+                continue
+            # Goresan tipis panjang: bbox besar tapi isinya kosong
+            if density < 0.06:
+                continue
+            # Noda pekat hampir kotak penuh (tulisan tidak pernah sepadat ini)
+            if density > 0.92 and w > 0.03 * W_img and hh > 0.03 * H_img:
+                continue
+            keep[i] = True
+        binary = np.where(keep[lbl], 255, 0).astype(np.uint8)
 
     # 2) Deteksi garis pemisah: kontur sangat lebar & pipih
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -301,7 +341,8 @@ st.title("🌴 Pembaca Patok Blok / TPH")
 # Pengaturan disembunyikan dalam expander (hemat layar HP)
 with st.expander("⚙️ Pengaturan"):
     suara_aktif = st.toggle("🔊 Bacakan hasil lewat suara", value=True)
-    hapus_bg = st.toggle("🧹 Hapus background (tampilkan tulisan saja)", value=False)
+    hapus_bg = st.toggle("🧹 Hapus background sebelum diproses model", value=True)
+    hilangkan_noise = st.toggle("✨ Hilangkan noise/kotoran non-karakter", value=True)
     tampil_biner = st.toggle("Tampilkan gambar biner (debug)", value=False)
     block_size = st.slider("Block size threshold (ganjil)", 21, 81, 41, step=2)
     c_thresh = st.slider("Konstanta C threshold", 5, 35, 15)
@@ -332,7 +373,8 @@ bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # Proses
 with st.spinner("Memproses..."):
-    hasil = baca_patok(bgr, block_size=block_size, c_thresh=c_thresh, min_h_ratio=min_h)
+    hasil = baca_patok(bgr, block_size=block_size, c_thresh=c_thresh, min_h_ratio=min_h,
+                       hapus_bg=hapus_bg, hilangkan_noise=hilangkan_noise)
 
 terdeteksi = bool(hasil["nomor_blok"] or hasil["nomor_tph"])
 
@@ -372,17 +414,17 @@ if not hasil["sep_found"]:
     st.warning("Garis pemisah tidak terdeteksi — memakai tengah gambar sebagai batas.")
 
 # Gambar hasil deteksi di bawah kartu
-if hapus_bg:
-    st.image(hasil["vis_bersih"], caption="Hasil deteksi (background dihapus)",
+st.image(hasil["vis"], caption="Hasil deteksi", use_container_width=True)
+
+with st.expander("🧹 Lihat gambar yang masuk ke model (bersih)"):
+    st.image(hasil["vis_bersih"],
+             caption="Setelah hapus background & hilangkan noise",
              use_container_width=True)
-    # Tombol download gambar bersih tanpa anotasi
     ok_png, buf_png = cv2.imencode(".png", cv2.cvtColor(hasil["bersih"], cv2.COLOR_RGB2BGR))
     if ok_png:
         st.download_button("⬇️ Download gambar bersih (PNG)", data=buf_png.tobytes(),
                            file_name="patok_bersih.png", mime="image/png",
                            use_container_width=True)
-else:
-    st.image(hasil["vis"], caption="Hasil deteksi", use_container_width=True)
 
 if tampil_biner:
     st.image(hasil["binary"], caption="Gambar biner (debug)",
