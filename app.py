@@ -62,15 +62,25 @@ st.markdown("""
 /* Judul lebih ringkas di HP */
 h1 { font-size: 1.5rem !important; }
 
-/* Perbesar preview kamera: penuhi lebar layar */
-[data-testid="stCameraInput"] { width: 100% !important; }
+/* Kamera: frame rasio 4:5 (pas untuk patok Blok/garis/TPH), bukan full portrait */
+[data-testid="stCameraInput"] { width: 100% !important; position: relative; }
 [data-testid="stCameraInput"] > div { width: 100% !important; }
 [data-testid="stCameraInput"] video {
     width: 100% !important;
+    aspect-ratio: 4 / 5;
     height: auto !important;
-    min-height: 60vh;              /* preview tinggi, mudah membidik patok */
-    object-fit: cover;
+    max-height: 55vh;
+    object-fit: cover;             /* preview = persis area yang akan diproses */
     border-radius: 12px;
+}
+/* Panduan bidik: kotak putus-putus di tengah preview */
+[data-testid="stCameraInput"]::after {
+    content: "";
+    position: absolute;
+    top: 8%; left: 12%; right: 12%; bottom: 22%;
+    border: 3px dashed rgba(255, 255, 255, 0.75);
+    border-radius: 14px;
+    pointer-events: none;
 }
 [data-testid="stCameraInput"] img {
     width: 100% !important;
@@ -352,16 +362,20 @@ with st.expander("⚙️ Pengaturan"):
 tab_kamera, tab_upload = st.tabs(["📷 Kamera", "🖼️ Upload"])
 
 img_file = None
+dari_kamera = False
 with tab_kamera:
+    st.caption("Posisikan tulisan patok di dalam kotak putus-putus.")
     foto = st.camera_input("Arahkan ke patok, lalu ambil foto",
                            label_visibility="collapsed")
     if foto is not None:
         img_file = foto
+        dari_kamera = True
 with tab_upload:
     up = st.file_uploader("Pilih foto patok", type=["png", "jpg", "jpeg", "bmp"],
                           label_visibility="collapsed")
     if up is not None:
         img_file = up
+        dari_kamera = False
 
 if img_file is None:
     st.info("📷 Ambil foto patok atau upload gambar untuk memulai.")
@@ -370,6 +384,20 @@ if img_file is None:
 # Decode gambar
 pil_img = Image.open(img_file).convert("RGB")
 bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+# Foto dari kamera: crop tengah ke rasio 4:5 supaya SAMA dengan preview
+# (preview memakai object-fit: cover, jadi pinggiran di luar frame dibuang)
+if dari_kamera:
+    Hf, Wf = bgr.shape[:2]
+    target = 4 / 5  # lebar : tinggi
+    if Wf / Hf > target:      # terlalu lebar -> pangkas kiri-kanan
+        new_w = int(Hf * target)
+        x0 = (Wf - new_w) // 2
+        bgr = bgr[:, x0:x0 + new_w]
+    else:                      # terlalu tinggi -> pangkas atas-bawah
+        new_h = int(Wf / target)
+        y0 = (Hf - new_h) // 2
+        bgr = bgr[y0:y0 + new_h, :]
 
 # Proses
 with st.spinner("Memproses..."):
